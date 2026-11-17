@@ -1,0 +1,7 @@
+numpy
+PyAudioWPatch
+Pillow
+psutil
+pystray
+pywebview
+pythonnet
