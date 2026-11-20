@@ -527,7 +527,7 @@ class Recorder:
             threading.Thread(target=self._read_stderr, args=(self.proc,), daemon=True).start()
             if self.mixer.sources:
                 self.mixer.start(self.proc.stdin)
-            self.proc.wait()
+            self._wait_for_capture()
             self.mixer.close()
             if self.stop_evt.is_set():
                 break
@@ -538,6 +538,22 @@ class Recorder:
                 self.mode += 1
                 log.info("пробую другой энкодер: %s", self.encoders[self.mode])
             self.stop_evt.wait(2)
+
+    def _wait_for_capture(self):
+        # Размер последнего файла растёт и без видео. Признак живого захвата —
+        # смена сегмента, которую FFmpeg выполняет по ключевому видеокадру.
+        latest = None
+        deadline = time.monotonic() + 15  # дайте устройствам время на запуск
+        while self.proc.poll() is None and not self.stop_evt.wait(1):
+            segments = self.segments()
+            if segments and segments[-1] != latest:
+                latest = segments[-1]
+                deadline = time.monotonic() + 8 * SEGMENT_SEC
+            elif time.monotonic() >= deadline:
+                log.error("Нет новых видеосегментов: перезапускаю захват (%s)", latest)
+                self.proc.kill()
+                break
+        self.proc.wait()
 
     def _read_stderr(self, proc):
         for line in proc.stderr:
@@ -580,40 +596,45 @@ class Recorder:
         dur = self.cfg["duration_sec"]
         pressed = time.time()
         since = pressed - dur
-        # ждём, пока допишется текущий сегмент (≤1 с) — иначе в конце клипа битый кадр
+        session = self.session_dir
         before = self.segments()
-        segs = before
-        while time.time() < pressed + SEGMENT_SEC + 1:
+        if not before:
+            raise RuntimeError("буфер пуст — запись ещё не началась")
+        deadline = time.monotonic() + SEGMENT_SEC + 1
+        while time.monotonic() < deadline:
             now = self.segments()
-            if now and before and now[-1] != before[-1]:
-                segs = now[:-1]  # всё, кроме только что начатого
+            if self.session_dir != session or self.stop_evt.is_set():
+                raise RuntimeError("захват перезапускается — попробуйте ещё раз")
+            if now and now[-1] != before[-1]:
                 break
             time.sleep(0.05)
-        segs, candidates = [], segs
-        for f in candidates:  # сегменты, которые закончились внутри окна
-            try:
-                if f.stat().st_mtime >= since:
-                    segs.append(f)
-            except OSError:
-                pass
+        else:
+            raise RuntimeError("нет новых видеокадров — клип не сохранён")
+
+        # Последний файл ещё открыт. Берём только закрытые сегменты этой сессии.
+        segs = [f for f in now[:-1] if f.stat().st_mtime >= since]
         if not segs:
-            raise RuntimeError("буфер пуст — запись ещё не началась")
+            raise RuntimeError("в буфере нет свежего видео")
         out = output_dir(self.cfg) / f"{name_hint}_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp4"
-        tmp = BUF_DIR / f"clip_{time.time_ns()}.ts"
-        with open(tmp, "wb") as w:  # mpegts можно просто склеить байтами
-            for s in segs:
-                try:
-                    with open(s, "rb") as r:
+        stamp = time.time_ns()
+        tmp = BUF_DIR / f"clip_{stamp}.ts"
+        pending = out.with_name(f".clip_{stamp}.part")
+        try:
+            with tmp.open("wb") as w:
+                for s in segs:
+                    with s.open("rb") as r:
                         shutil.copyfileobj(r, w)
-                except OSError:
-                    pass
-        # -map 0: все дорожки (по умолчанию ffmpeg взял бы одну)
-        r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-sseof", f"-{dur}", "-i", str(tmp),
-                            "-map", "0", "-c", "copy", *self._track_meta(), "-movflags", "+faststart", str(out)],
-                           capture_output=True, creationflags=NO_WINDOW)
-        tmp.unlink(missing_ok=True)
-        if r.returncode != 0 or not out.exists():
-            raise RuntimeError(r.stderr.decode("utf-8", "replace")[-500:])
+            cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-abort_on", "empty_output_stream",
+                   "-sseof", f"-{dur}", "-i", str(tmp), "-t", str(dur),
+                   "-map", "0:v:0", "-map", "0:a?", "-c", "copy", *self._track_meta(),
+                   "-movflags", "+faststart", "-f", "mp4", str(pending)]
+            result = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW)
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode("utf-8", "replace")[-500:])
+            pending.replace(out)
+        finally:
+            tmp.unlink(missing_ok=True)
+            pending.unlink(missing_ok=True)
         end = self.origin() + (self.seg_index(segs[-1]) + 1) * SEGMENT_SEC
         self.last_span = (max(end - dur, self.origin() + self.seg_index(segs[0]) * SEGMENT_SEC), end)
         return out
