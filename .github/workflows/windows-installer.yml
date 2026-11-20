@@ -32,8 +32,13 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest 'https://github.com/loading1user/replay-buffer/releases/download/main/ReplayBuffer-Setup-1.0.0-x64.exe' -OutFile $old
           if ((Get-FileHash $old).Hash -ne '2103D6743ADBFCCAE7376B981049720E197BEEEEEE960D77C0B4763C950A1B65') { throw "Legacy installer checksum mismatch" }
+          python -m pip install pyinstaller
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $engine = Join-Path $env:RUNNER_TEMP 'legacy-engine.exe'
+          python -c "import sys; from pathlib import Path; from PyInstaller.archive.readers import CArchiveReader; Path(sys.argv[2]).write_bytes(CArchiveReader(sys.argv[1]).extract('engine.exe'))" $old $engine
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $app = Join-Path $env:LOCALAPPDATA 'Programs\ReplayBufferUpgradeTest'
-          $p = Start-Process $old -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR=`"$app`"" -PassThru
+          $p = Start-Process $engine -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR=`"$app`"" -PassThru
           if (-not $p.WaitForExit(180000)) { throw "Legacy installer did not exit in three minutes" }
           if ($p.ExitCode) { throw "Legacy setup failed ($($p.ExitCode))" }
           Get-Process ReplayBuffer -ErrorAction SilentlyContinue | Where-Object Path -eq "$app\ReplayBuffer.exe" | Stop-Process
