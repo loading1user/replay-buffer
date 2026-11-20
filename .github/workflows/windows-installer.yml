@@ -1,0 +1,73 @@
+name: Windows installer
+on:
+  push:
+    branches: [main]
+    paths: ['ui/VERSION']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install previous release for the upgrade test
+        run: |
+          $version = (Get-Content ui/VERSION -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          $old = Join-Path $env:RUNNER_TEMP 'ReplayBuffer-1.0.0.exe'
+          Invoke-WebRequest 'https://github.com/loading1user/replay-buffer/releases/download/main/ReplayBuffer-Setup-1.0.0-x64.exe' -OutFile $old
+          if ((Get-FileHash $old).Hash -ne '2103D6743ADBFCCAE7376B981049720E197BEEEEEE960D77C0B4763C950A1B65') { throw "Legacy installer checksum mismatch" }
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\ReplayBufferUpgradeTest'
+          $p = Start-Process $old -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR=`"$app`"" -PassThru -Wait
+          if ($p.ExitCode) { throw "Legacy setup failed ($($p.ExitCode))" }
+          New-Item -ItemType Directory -Force bin | Out-Null
+          Copy-Item "$app\_internal\bin\ffmpeg.exe" bin
+      - name: Build application and installer
+        run: |
+          python -m pip install -r requirements.txt pyinstaller
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet publish proccap/proccap.csproj -c Release -r win-x64 --self-contained true -o bin/proccap
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m PyInstaller --noconfirm ReplayBuffer.spec
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile bin/MicrosoftEdgeWebview2Setup.exe
+          $sig = Get-AuthenticodeSignature bin/MicrosoftEdgeWebview2Setup.exe
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "Unexpected bootstrapper signature" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" setup.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test upgrade and repeat installation
+        run: |
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\ReplayBufferUpgradeTest'
+          $config = Join-Path $env:APPDATA 'ReplayBuffer\config.json'
+          $clip = Join-Path $env:USERPROFILE 'Videos\Replays\upgrade-test.mp4'
+          foreach ($file in $config,$clip) {
+            New-Item -ItemType Directory -Force (Split-Path $file) | Out-Null
+            Set-Content $file '{}'
+          }
+          $hashes = (Get-FileHash $config,$clip).Hash -join ','
+          $setup = (Get-Item "release/ReplayBuffer-Setup-$env:VERSION-x64.exe").FullName
+          foreach ($attempt in 1..2) {
+            $p = Start-Process $setup -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -PassThru -Wait
+            if ($p.ExitCode) { throw "Upgrade failed ($($p.ExitCode))" }
+            if ((Get-Content "$app\_internal\ui\VERSION" -Raw).Trim() -ne $env:VERSION) { throw "Previous install directory was not upgraded" }
+            if (((Get-FileHash $config,$clip).Hash -join ',') -ne $hashes) { throw "User data changed" }
+          }
+      - name: Publish installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$env:VERSION" "release/ReplayBuffer-Setup-$env:VERSION-x64.exe" --target $env:GITHUB_SHA --title "Replay Buffer $env:VERSION" --generate-notes --latest

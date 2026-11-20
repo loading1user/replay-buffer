@@ -1476,6 +1476,7 @@ class App:
             pystray.MenuItem(lambda _: f"Сохранить клип ({self.cfg['hotkey'].upper()})", lambda: self.save()),
             pystray.MenuItem("Папка с клипами", lambda: os.startfile(output_dir(self.cfg))),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Проверить обновления", self.check_updates),
             pystray.MenuItem("Выход", lambda: self.quit()),
         )
 
@@ -1592,6 +1593,35 @@ class App:
             h = self.hwnd()
             if h:
                 user32.SetForegroundWindow(h)
+
+    def check_updates(self):
+        threading.Thread(target=self._check_updates, daemon=True).start()
+
+    def _check_updates(self):
+        from urllib.request import urlopen
+        import re
+        repo = "loading1user/replay-buffer"
+        try:
+            current = (RES_DIR / "ui" / "VERSION").read_text(encoding="ascii").strip()
+            with urlopen(f"https://api.github.com/repos/{repo}/releases/latest", timeout=10) as response:
+                release = json.load(response)
+            for asset in release["assets"]:
+                match = re.fullmatch(r"ReplayBuffer-Setup-(\d+\.\d+\.\d+)-x64\.exe", asset["name"])
+                if match:
+                    latest = match[1]
+                    break
+            else:
+                raise ValueError("В релизе отсутствует установщик Windows x64")
+            if tuple(map(int, latest.split("."))) <= tuple(map(int, current.split("."))):
+                user32.MessageBoxW(0, f"Установлена актуальная версия {current}.", APP_NAME, 0x40)
+                return
+            if user32.MessageBoxW(0, f"Доступна версия {latest}. Скачать установщик?", APP_NAME, 0x24) == 6:
+                from urllib.parse import quote
+                tag = quote(release["tag_name"], safe="")
+                os.startfile(f"https://github.com/{repo}/releases/download/{tag}/{asset['name']}")
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("Проверка обновлений: %s", e)
+            user32.MessageBoxW(0, "Не удалось проверить обновления. Попробуйте позже.", APP_NAME, 0x30)
 
     def quit(self):
         self.quitting = True
